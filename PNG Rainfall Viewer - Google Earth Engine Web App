@@ -1,0 +1,194 @@
+// PNG Rainfall Viewer - Google Earth Engine Web App
+// Author: Nyran Abraham Tahija
+// Enhanced: Map-based legend, compact chart & stats panel, reversed color scale
+
+Map.setOptions('SATELLITE');
+
+var aoi = ee.FeatureCollection("projects/fresh-century-432117-j1/assets/gadm41_PNG_1_Provincal_level");
+var provinceNames = aoi.aggregate_array('NAME_1').distinct().sort();
+provinceNames = ee.List(["All Provinces"]).cat(provinceNames);
+
+var defaultStart = '2024-01-01';
+var defaultEnd = '2024-12-31';
+Map.setCenter(146.8, -6.0, 5);
+
+// UI elements
+var title = ui.Label('Papua New Guinea Rainfall Viewer', {fontSize: '20px', fontWeight: 'bold'});
+var author = ui.Label('Author: Nyran Abraham Tahija', {fontSize: '12px', margin: '0 0 8px 0'});
+
+var provinceSelect = ui.Select({items: provinceNames.getInfo(), value: 'All Provinces', placeholder: 'Select province', onChange: updateMap});
+var dateStart = ui.Textbox({value: defaultStart, placeholder: 'YYYY-MM-DD'});
+var dateEnd = ui.Textbox({value: defaultEnd, placeholder: 'YYYY-MM-DD'});
+var last12Btn = ui.Button('Last 12 months', setLast12);
+var year2024Btn = ui.Button('Calendar 2024', function(){ dateStart.setValue('2024-01-01'); dateEnd.setValue('2024-12-31'); });
+var runButton = ui.Button({label: 'Update Map & Charts', onClick: updateMap});
+
+var exportImageButton = ui.Button('Export Raster to Drive', function() {
+  if (!lastClippedImage) { ui.alert('Please run Update first.'); return; }
+  Export.image.toDrive({
+    image: lastClippedImage, 
+    description: 'Total_Rainfall_Selected', 
+    folder: 'Nyran Works', 
+    region: lastAOI.geometry(), 
+    scale: 5000, 
+    crs: 'EPSG:4326', 
+    fileFormat: 'GeoTIFF', 
+    maxPixels: 1e13
+  });
+});
+
+var exportAOIButton = ui.Button('Export AOI GeoJSON to Drive', function() {
+  var province = provinceSelect.getValue();
+  var filtered = (province === 'All Provinces') ? aoi : aoi.filter(ee.Filter.eq('NAME_1', province));
+  var nameSafe = province.split(' ').join('_');
+  Export.table.toDrive({collection: filtered, description: 'AOI_Boundary_' + nameSafe, fileFormat: 'GeoJSON', folder: 'Nyran Works'});
+});
+
+var exportTableButton = ui.Button('Export Monthly CSV to Drive', function() {
+  if (!lastMonthlyFc) { ui.alert('Please run Update first.'); return; }
+  Export.table.toDrive({collection: lastMonthlyFc, description: 'Monthly_Rainfall_Selected', folder: 'Nyran Works', fileFormat: 'CSV'});
+});
+
+// Left panel UI
+var leftPanel = ui.Panel({
+  widgets: [title, author, ui.Label('Select Province:'), provinceSelect,
+            ui.Label('Start date (YYYY-MM-DD):'), dateStart, ui.Label('End date (YYYY-MM-DD):'), dateEnd,
+            ui.Panel([last12Btn, year2024Btn], ui.Panel.Layout.flow('horizontal')),
+            runButton, ui.Label('Export / Download:'), exportImageButton, exportTableButton, exportAOIButton],
+  style: {width: '320px', padding: '8px'}
+});
+ui.root.insert(0, leftPanel);
+
+// Compact chart & stats panel
+var chartPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {position: 'bottom-right', width: '480px', height: '350px', padding: '8px'}
+});
+ui.root.add(chartPanel);
+
+var lastClippedImage = null;
+var lastAOI = null;
+var lastMonthlyFc = null;
+
+function updateMap() {
+  var province = provinceSelect.getValue();
+  var start = dateStart.getValue();
+  var end = dateEnd.getValue();
+  if (!start || !end) { ui.alert('Please enter both start and end dates.'); return; }
+
+  var selectedAOI = (province === 'All Provinces') ? aoi.geometry() : aoi.filter(ee.Filter.eq('NAME_1', province)).geometry();
+  lastAOI = (province === 'All Provinces') ? ee.Feature(null, {}) : aoi.filter(ee.Filter.eq('NAME_1', province)).first();
+
+  var dataset = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end).filterBounds(selectedAOI);
+  var precipitation = dataset.select('precipitation');
+  var precipitationSum = precipitation.sum();
+  var clipped = precipitationSum.clip(selectedAOI);
+  lastClippedImage = clipped;
+
+  // Reversed color palette: very low = red, very high = blue
+  var precipitationVis = {min: 2429.3, max: 4622.7, palette: ['red','orange','yellow','green','blue']};
+
+  Map.layers().reset();
+  Map.setOptions('SATELLITE');
+
+  var aoiFiltered = (province === 'All Provinces') ? aoi : aoi.filter(ee.Filter.eq('NAME_1', province));
+  var aoiStyle = aoiFiltered.style({color: '#000000', fillColor: '#00000000', width: 2});
+  Map.addLayer(aoiStyle, {}, (province === 'All Provinces') ? 'PNG boundaries' : (province + ' boundary'));
+  Map.addLayer(clipped, precipitationVis, 'Total Rainfall');
+  Map.centerObject(aoiFiltered, 6);
+
+  // Monthly rainfall chart
+  var startDate = ee.Date(start);
+  var endDate = ee.Date(end);
+  var months = monthsBetween(startDate, endDate);
+  var monthlyList = ee.List.sequence(0, months.subtract(1));
+
+  var monthlyFeatures = monthlyList.map(function(i) {
+    var s = startDate.advance(i, 'month');
+    var e = s.advance(1, 'month');
+    var monthlySum = precipitation.filterDate(s, e).sum();
+    var meanVal = monthlySum.reduceRegion({reducer: ee.Reducer.mean(), geometry: selectedAOI, scale: 5000, maxPixels: 1e13}).get('precipitation');
+    var monthLabel = ee.Date(s).format('MMM yyyy');
+    return ee.Feature(null, {'month': monthLabel, 'rainfall_mm': ee.Number(meanVal)});
+  });
+
+  var monthlyFc = ee.FeatureCollection(monthlyFeatures);
+  lastMonthlyFc = monthlyFc;
+
+  var colChart = ui.Chart.feature.byFeature({features: monthlyFc, xProperty: 'month', yProperties: ['rainfall_mm']})
+    .setChartType('ColumnChart')
+    .setOptions({title: 'Average Monthly Rainfall (' + province + ')', hAxis: {title: 'Month'}, vAxis: {title: 'Rainfall (mm)'}, legend: {position: 'none'}, colors: ['#1f77b4']});
+
+  // Rainfall stats
+  var statz = precipitationSum.reduceRegion({reducer: ee.Reducer.mean().combine(ee.Reducer.min(), '', true).combine(ee.Reducer.max(), '', true).combine(ee.Reducer.stdDev(), '', true), geometry: selectedAOI, scale: 5000, maxPixels: 1e13});
+  statz.evaluate(function(res){
+    var mean = (res && res.precipitation_mean) ? res.precipitation_mean.toFixed(2) : 'n/a';
+    var minv = (res && res.precipitation_min) ? res.precipitation_min.toFixed(2) : 'n/a';
+    var maxv = (res && res.precipitation_max) ? res.precipitation_max.toFixed(2) : 'n/a';
+    var sd = (res && res.precipitation_stdDev) ? res.precipitation_stdDev.toFixed(2) : 'n/a';
+
+    chartPanel.clear();
+    var statsPanel = ui.Panel({
+      widgets: [
+        ui.Label('Rainfall Statistics', {fontWeight: 'bold'}),
+        ui.Label('Mean (mm): ' + mean),
+        ui.Label('Min (mm): ' + minv),
+        ui.Label('Max (mm): ' + maxv),
+        ui.Label('StdDev (mm): ' + sd)
+      ],
+      style: {padding: '4px', margin: '0 0 6px 0'}
+    });
+    chartPanel.add(statsPanel);
+    chartPanel.add(colChart);
+  });
+}
+
+// Map legend displayed once
+function addMapLegend() {
+  var legend = ui.Panel({
+    style: {
+      position: 'bottom-left',
+      padding: '8px 15px',
+      backgroundColor: 'white',
+      border: '1px solid black'
+    }
+  });
+
+  legend.add(ui.Label('Rainfall Legend', {fontWeight: 'bold', fontSize: '14px'}));
+
+  var colors = ['red','orange','yellow','green','blue'];
+  var labels = ['Low','Low','Moderate','High','High'];
+
+  for (var i = 0; i < colors.length; i++) {
+    var colorBox = ui.Label('', {backgroundColor: colors[i], padding: '8px', margin: '0 0 4px 0'});
+    var label = ui.Label(labels[i], {margin: '0 0 4px 6px'});
+    var row = ui.Panel([colorBox, label], ui.Panel.Layout.Flow('horizontal'));
+    legend.add(row);
+  }
+
+  Map.add(legend);
+}
+
+// Add the legend once
+addMapLegend();
+
+// Utility functions
+function monthsBetween(startDate, endDate) {
+  var ys = ee.Number(startDate.get('year'));
+  var ms = ee.Number(startDate.get('month'));
+  var ye = ee.Number(endDate.get('year'));
+  var me = ee.Number(endDate.get('month'));
+  return ye.subtract(ys).multiply(12).add(me.subtract(ms)).add(1);
+}
+
+function setLast12() {
+  var now = new Date();
+  var end = now.toISOString().slice(0,10);
+  var past = new Date(now.getFullYear(), now.getMonth()-11, 1);
+  var start = past.toISOString().slice(0,10);
+  dateStart.setValue(start);
+  dateEnd.setValue(end);
+}
+
+// Initialize map
+updateMap();
